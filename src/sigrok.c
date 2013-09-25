@@ -40,6 +40,12 @@ static int num_devices;
 static int loglevel = SR_LOG_WARN;
 static struct sr_context *sr_ctx;
 
+struct average_guage {
+	int mq; /* Measured Quantity (Type) */
+	unsigned int samples;
+	double total;
+};
+
 struct config_device {
 	char *name;
 	char *driver;
@@ -48,8 +54,39 @@ struct config_device {
 	struct sr_dev_inst *sdi;
 	cdtime_t min_dispatch_interval;
 	cdtime_t last_dispatch;
+	struct average_guage avg;
 };
 
+static void sigrok_average_guage_reset(struct average_guage *avg)
+{
+	avg->total = 0;
+	avg->samples = 0;
+	avg->mq = 0;
+}
+
+static unsigned int sigrok_average_guage_update(struct average_guage *avg, const struct sr_datafeed_analog *analog)
+{
+	/* We must only average Apples with Apples */
+	if (avg->mq != analog->mq)
+		sigrok_average_guage_reset(avg);
+
+	/* Ignore all but the first sample on the first probe. */
+	avg->total += analog->data[0];
+	avg->mq = analog->mq;
+	avg->samples++;
+
+	return avg->samples;
+}
+
+static double sigrok_average_guage_get(struct average_guage *avg)
+{
+	double val = 0;
+
+	if (avg->samples != 0)
+		val = avg->total / avg->samples;
+
+	return val;
+}
 
 static int sigrok_log_callback(void*cb_data __attribute__((unused)),
 		int msg_loglevel, const char *format, va_list args)
@@ -194,14 +231,19 @@ static void sigrok_feed_callback(const struct sr_dev_inst *sdi,
 	if (packet->type != SR_DF_ANALOG)
 		return;
 
+	analog = packet->payload;
+
+	/* Always maintain an average rather than a 'last sample' policy */
+	sigrok_average_guage_update(&cfdev->avg, analog);
+
+	/* Don't dispatch greater than the interval requested */
 	if ((cfdev->min_dispatch_interval != 0)
 			&& ((cdtime() - cfdev->last_dispatch)
 				< cfdev->min_dispatch_interval))
 		return;
 
-	/* Ignore all but the first sample on the first probe. */
-	analog = packet->payload;
-	value.gauge = analog->data[0];
+	/* Dispatch the average reading over the period */
+	value.gauge = sigrok_average_guage_get(&cfdev->avg);
 	vl.values = &value;
 	vl.values_len = 1;
 	sstrncpy(vl.host, hostname_g, sizeof(vl.host));
@@ -212,6 +254,9 @@ static void sigrok_feed_callback(const struct sr_dev_inst *sdi,
 
 	plugin_dispatch_values(&vl);
 	cfdev->last_dispatch = cdtime();
+
+	/* Reset the running average now that it has dispatched.. */
+	sigrok_average_guage_reset(&cfdev->avg);
 }
 
 static void sigrok_free_drvopts(struct sr_config *src)
