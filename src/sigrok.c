@@ -26,6 +26,8 @@
 #include <time.h>
 #include <pthread.h>
 
+#include <math.h>
+
 #include <glib.h>
 #include <libsigrok/libsigrok.h>
 
@@ -40,6 +42,24 @@ static int num_devices;
 static int loglevel = SR_LOG_WARN;
 static struct sr_context *sr_ctx;
 
+typedef enum {
+    CONSOLIDATE_LAST,
+    CONSOLIDATE_MIN,
+    CONSOLIDATE_MAX,
+    CONSOLIDATE_AVG,
+} consolidation_t;
+
+struct consolidated_value {
+	consolidation_t type;
+	int mq; /* Measured Quantity */
+	unsigned int samples;
+
+	union {
+		double total;	/* average */
+		double val;	/* min / max / last */
+	};
+};
+
 struct config_device {
 	char *name;
 	char *driver;
@@ -48,8 +68,78 @@ struct config_device {
 	struct sr_dev_inst *sdi;
 	cdtime_t min_dispatch_interval;
 	cdtime_t last_dispatch;
+	struct consolidated_value cv;
 };
 
+static void sigrok_consolidation_reset(struct consolidated_value *cv)
+{
+	/* Save the Type */
+	consolidation_t type = cv->type;
+
+	/* Reset the rest */
+	memset(cv, 0, sizeof(*cv));
+	cv->type = type;
+
+	/* Min and Max need to be initialised to Infinity to allow the first value to match */
+	if (type == CONSOLIDATE_MIN)
+	    cv->val = INFINITY;
+
+	if (type == CONSOLIDATE_MAX)
+	    cv->val = -INFINITY;
+}
+
+static void sigrok_consolidation_update(struct consolidated_value *cv, const struct sr_datafeed_analog *analog)
+{
+	/* Ignore all but the first sample on the first probe. */
+	double val = analog->data[0];
+
+	/* We must only average Apples with Apples */
+	if (cv->mq != analog->mq)
+		sigrok_consolidation_reset(cv);
+
+	cv->mq = analog->mq;
+	cv->samples++;
+
+	switch (cv->type)
+	{
+	case CONSOLIDATE_AVG:
+		cv->total += val;
+		break;
+	case CONSOLIDATE_MIN:
+		if (val < cv->val)
+		    cv->val = val;
+		break;
+	case CONSOLIDATE_MAX:
+		if (val > cv->val)
+		    cv->val = val;
+		break;
+	case CONSOLIDATE_LAST:
+	default:
+		cv->val = val;
+		break;
+	}
+}
+
+static double sigrok_consolidation_get(struct consolidated_value *cv)
+{
+	double val = 0;
+
+	switch (cv->type)
+	{
+	case CONSOLIDATE_AVG:
+		if (cv->samples != 0)
+			val = cv->total / cv->samples;
+		break;
+	default:
+	case CONSOLIDATE_MIN:
+	case CONSOLIDATE_MAX:
+	case CONSOLIDATE_LAST:
+		val = cv->val;
+		break;
+	}
+
+	return val;
+}
 
 static int sigrok_log_callback(void*cb_data __attribute__((unused)),
 		int msg_loglevel, const char *format, va_list args)
@@ -80,6 +170,7 @@ static int sigrok_config_device(oconfig_item_t *ci)
 		return -1;
 	}
 	cfdev->min_dispatch_interval = DEFAULT_MIN_DISPATCH_INTERVAL;
+	cfdev->cv.type = CONSOLIDATE_LAST;
 
 	for (i = 0; i < ci->children_num; i++) {
 		oconfig_item_t *item = ci->children + i;
@@ -91,6 +182,21 @@ static int sigrok_config_device(oconfig_item_t *ci)
 			cf_util_get_string(item, &cfdev->serialcomm);
 		else if (!strcasecmp(item->key, "minimuminterval"))
 			cf_util_get_cdtime(item, &cfdev->min_dispatch_interval);
+		else if (!strcasecmp(item->key, "consolidation")) {
+			// Consolidation min|max|average|last
+			char consolidation_option[8];
+
+			cf_util_get_string_buffer(item, consolidation_option, sizeof(consolidation_option));
+
+			if (!strcasecmp(consolidation_option, "min"))
+			    cfdev->cv.type = CONSOLIDATE_MIN;
+			else if (!strcasecmp(consolidation_option, "max"))
+			    cfdev->cv.type = CONSOLIDATE_MAX;
+			else if (!strcasecmp(consolidation_option, "average"))
+			    cfdev->cv.type = CONSOLIDATE_AVG;
+			else if (!strcasecmp(consolidation_option, "last"))
+			    cfdev->cv.type = CONSOLIDATE_LAST;
+		}
 		else
 			WARNING("sigrok plugin: Invalid keyword \"%s\".",
 					item->key);
@@ -194,14 +300,17 @@ static void sigrok_feed_callback(const struct sr_dev_inst *sdi,
 	if (packet->type != SR_DF_ANALOG)
 		return;
 
+	analog = packet->payload;
+	sigrok_consolidation_update(&cfdev->cv, analog);
+
+	/* Don't dispatch greater than the interval requested */
 	if ((cfdev->min_dispatch_interval != 0)
 			&& ((cdtime() - cfdev->last_dispatch)
 				< cfdev->min_dispatch_interval))
 		return;
 
-	/* Ignore all but the first sample on the first probe. */
-	analog = packet->payload;
-	value.gauge = analog->data[0];
+	/* Dispatch the value as configured by the consolidation of the period */
+	value.gauge = sigrok_consolidation_get(&cfdev->cv);
 	vl.values = &value;
 	vl.values_len = 1;
 	sstrncpy(vl.host, hostname_g, sizeof(vl.host));
@@ -212,6 +321,9 @@ static void sigrok_feed_callback(const struct sr_dev_inst *sdi,
 
 	plugin_dispatch_values(&vl);
 	cfdev->last_dispatch = cdtime();
+
+	/* Reset the consolidation value now that it has dispatched */
+	sigrok_consolidation_reset(&cfdev->cv);
 }
 
 static void sigrok_free_drvopts(struct sr_config *src)
